@@ -11,6 +11,7 @@ on:
 env:
   CARGO_TERM_COLOR: always
   RUST_VERSION: "1.75"
+  VCPKG_BINARY_SOURCES: "clear;x-gha,readwrite"
 
 jobs:
   build-rustdesk-windows:
@@ -20,6 +21,13 @@ jobs:
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
+
+      - name: Export GitHub Actions cache environment variables
+        uses: actions/github-script@v7
+        with:
+          script: |
+            core.exportVariable('ACTIONS_CACHE_URL', process.env.ACTIONS_CACHE_URL || '');
+            core.exportVariable('ACTIONS_RUNTIME_TOKEN', process.env.ACTIONS_RUNTIME_TOKEN || '');
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@v1
@@ -45,65 +53,71 @@ jobs:
 
       - name: Install vcpkg dependencies
         run: |
-          $VCPKG_ROOT/vcpkg install libvpx:x64-windows-static libyuv:x64-windows-static opus:x64-windows-static aom:x64-windows-static
-        shell: bash
+          vcpkg install libvpx:x64-windows-static libyuv:x64-windows-static opus:x64-windows-static aom:x64-windows-static
+        shell: cmd
+        env:
+          VCPKG_ROOT: ${{ github.workspace }}/vcpkg
 
       - name: Configure custom server settings
         shell: pwsh
         run: |
-          # Créer le fichier de configuration personnalisée
           $configContent = @"
           rendezvous_server = '${{ secrets.RENDEZVOUS_SERVER }}'
           relay_server = '${{ secrets.RELAY_SERVER }}'
           key = '${{ secrets.RS_PUB_KEY }}'
           "@
           
-          # Créer le dossier de config si nécessaire
-          New-Item -ItemType Directory -Force -Path "flutter\config" | Out-Null
-          
-          # Écrire la configuration
-          $configContent | Out-File -FilePath "flutter\config\custom_config.toml" -Encoding UTF8
+          New-Item -ItemType Directory -Force -Path "res" | Out-Null
+          $configContent | Out-File -FilePath "res\custom_config.toml" -Encoding UTF8
           
           Write-Host "Configuration created:"
-          Get-Content "flutter\config\custom_config.toml"
-
-      - name: Modify source to use custom config
-        shell: pwsh
-        run: |
-          # Modifier le fichier de configuration par défaut
-          $configFile = "src\ui_interface.rs"
-          if (Test-Path $configFile) {
-            $content = Get-Content $configFile -Raw
-            # Ajouter l'injection de la config personnalisée
-            # Note: Cette partie peut nécessiter des ajustements selon la version
-            Write-Host "Config file modified"
-          }
+          Get-Content "res\custom_config.toml"
 
       - name: Build rustdesk
-        shell: pwsh
+        shell: cmd
         run: |
-          $env:VCPKG_ROOT = "${{ github.workspace }}\vcpkg"
-          python3 .\build.py --portable --hwcodec
+          set VCPKG_ROOT=%GITHUB_WORKSPACE%\vcpkg
+          python build.py --portable --hwcodec
+        env:
+          GITHUB_WORKSPACE: ${{ github.workspace }}
 
-      - name: Rename output file
+      - name: Find and rename output file
         shell: pwsh
         run: |
-          $version = "1.4.5"
-          $outputDir = ".\flutter\build\windows\runner\Release"
-          if (Test-Path $outputDir) {
-            $files = Get-ChildItem -Path $outputDir -Filter "*.exe"
-            foreach ($file in $files) {
-              $newName = "rustdesk-eole-custom-$version-x86_64.exe"
-              Copy-Item $file.FullName -Destination ".\$newName"
-              Write-Host "Created: $newName"
+          $version = "custom"
+          
+          # Chercher l'exécutable dans différents endroits possibles
+          $searchPaths = @(
+            ".\flutter\build\windows\x64\runner\Release",
+            ".\flutter\build\windows\runner\Release",
+            ".\target\release"
+          )
+          
+          foreach ($searchPath in $searchPaths) {
+            if (Test-Path $searchPath) {
+              Write-Host "Searching in: $searchPath"
+              $files = Get-ChildItem -Path $searchPath -Filter "*.exe" -ErrorAction SilentlyContinue
+              
+              if ($files) {
+                foreach ($file in $files) {
+                  Write-Host "Found: $($file.FullName)"
+                  $newName = "rustdesk-eole-$version-x86_64.exe"
+                  Copy-Item $file.FullName -Destination ".\$newName"
+                  Write-Host "Created: $newName"
+                  exit 0
+                }
+              }
             }
           }
+          
+          Write-Host "No executable found, listing all files..."
+          Get-ChildItem -Recurse -Filter "*.exe" | Select-Object FullName
 
       - name: Upload artifact
         if: ${{ inputs.upload-artifact }}
         uses: actions/upload-artifact@v4
         with:
           name: rustdesk-eole-windows
-          path: |
-            rustdesk-eole-custom-*.exe
+          path: rustdesk-eole-*.exe
           retention-days: 30
+          if-no-files-found: warn
